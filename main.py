@@ -11,7 +11,6 @@ app = FastAPI(
     description="Direct LLM interface and RAG endpoints",
     version="1.2.0"
 )
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],

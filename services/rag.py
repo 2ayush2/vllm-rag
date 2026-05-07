@@ -1,6 +1,7 @@
 import os
 import shutil
 import time
+from typing import List, Optional, Generator
 
 import torch
 from langchain_chroma import Chroma
@@ -10,12 +11,7 @@ from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from core.model import LocalLLM
-
-
-
-DB_DIR = "./database/chroma_db"
-EMBEDDING_MODEL = "intfloat/multilingual-e5-small"
-
+from core.config import DB_DIR, EMBEDDING_MODEL
 
 class NepaliRAG:
     def __init__(self):
@@ -25,129 +21,99 @@ class NepaliRAG:
         self.current_doc = None
         self._try_load_existing_db()
 
-    # ── Setup ─────────────────────────────────────────────────────────────────
-
     @staticmethod
     def _load_embeddings() -> HuggingFaceEmbeddings:
-        print(f"Loading embedding model ({EMBEDDING_MODEL}) on cpu...")
+        """Initialize embedding model with CPU optimizations."""
         os.environ["PYTORCH_cpu_ALLOC_CONF"] = "expandable_segments:True"
-        model = HuggingFaceEmbeddings(
+        return HuggingFaceEmbeddings(
             model_name=EMBEDDING_MODEL,
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True, "batch_size": 8},
         )
-        print("Embedding model loaded.")
-        return model
 
     def _try_load_existing_db(self) -> None:
+        """Attempts to load a previously persisted Chroma database."""
         if not (os.path.exists(DB_DIR) and os.listdir(DB_DIR)):
             return
         try:
-            print("Found existing database. Loading...")
             self.db = Chroma(persist_directory=DB_DIR, embedding_function=self.embeddings)
             self.db.similarity_search("query: test", k=1)
             self.current_doc = "Previous Document"
-            print("Existing database loaded successfully.")
-        except Exception as e:
-            print(f"Database error ({e}). Removing stale data.")
-            self.db = None
+        except Exception:
             self._clear_db()
 
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
     def _clear_db(self) -> None:
-        """Release the Chroma client and wipe the DB directory."""
+        """Safely wipes the local Chroma database directory."""
         if self.db is not None:
             try:
-                self.db._client.stop()
-            except Exception:
-                pass
+                if hasattr(self.db, "_client") and hasattr(self.db._client, "stop"):
+                    self.db._client.stop()
+            except Exception: pass
             self.db = None
 
         time.sleep(1)
-
         if os.path.exists(DB_DIR):
-            for attempt in range(3):
+            for _ in range(3):
                 try:
                     shutil.rmtree(DB_DIR)
-                    print(f"Cleared database at {DB_DIR}")
-                    return
-                except Exception as e:
-                    print(f"Retry {attempt + 1}: Could not delete {DB_DIR}: {e}")
-                    time.sleep(1)
+                    break
+                except Exception: time.sleep(1)
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    def _build_rag_prompt(self, user_input: str, results: List[Document]) -> str:
+        """Constructs a clean prompt with document context."""
+        context = "\n---\n".join(d.page_content.removeprefix("passage: ") for d in results)
+        return (
+            "You are a helpful assistant. Use the following context to answer the user's question.\n"
+            "If the answer is not in the context, say you don't know based on the provided document.\n\n"
+            f"Context:\n{context}\n\n"
+            f"Question: {user_input}\n\n"
+            "Answer:"
+        )
 
     def load_document(self, pdf_path: str) -> str:
+        """Indexes a PDF document into the local Chroma vector store."""
         filename = os.path.basename(pdf_path)
-
         if self.current_doc == filename and self.db is not None:
-            return f"Document **{filename}** is already indexed and ready."
+            return f"Document **{filename}** is already ready."
 
         try:
-            print(f"Indexing: {filename}  |  model: {EMBEDDING_MODEL}")
-
-            chunks = RecursiveCharacterTextSplitter(
-                chunk_size=500, chunk_overlap=50,
-            ).split_documents(PyMuPDFLoader(pdf_path).load())
+            # Load and split
+            loader = PyMuPDFLoader(pdf_path)
+            splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+            chunks = splitter.split_documents(loader.load())
 
             if not chunks:
-                return "The PDF appears to be empty or unreadable."
+                return "The PDF appears to be empty."
 
-            # e5 models need a "passage: " prefix at index time
-            passages = [
-                Document(page_content="passage: " + d.page_content, metadata=d.metadata)
-                for d in chunks
-            ]
+            # Prefix for e5 models
+            passages = [Document(page_content="passage: " + d.page_content, metadata=d.metadata) for d in chunks]
 
             self._clear_db()
-
-            if torch.cpu.is_available():
+            if hasattr(torch, "cpu") and hasattr(torch.cpu, "empty_cache"):
                 torch.cpu.empty_cache()
 
-            self.db = Chroma.from_documents(
-                documents=passages,
-                embedding=self.embeddings,
-                persist_directory=DB_DIR,
-            )
+            self.db = Chroma.from_documents(documents=passages, embedding=self.embeddings, persist_directory=DB_DIR)
             self.current_doc = filename
-            return f"Document **{filename}** indexed successfully ({len(passages)} chunks)."
-
+            return f"Document **{filename}** indexed successfully."
         except Exception as e:
-            print(f"Ingestion error: {e}")
-            return f"Failed to load document: {e}"
+            return f"Failed to load document: {str(e)}"
 
-    def query(self, user_input: str, sys_msg: str = None, mode: str = "RAG (PDF Context)"):
-        is_rag = mode == "RAG (PDF Context)"
-
-        if is_rag and self.db is None:
-            yield "Please upload a PDF document first using the panel on the left."
+    def query(self, user_input: str, sys_msg: Optional[str] = None, mode: str = "RAG (PDF Context)") -> Generator[str, None, None]:
+        """Main query interface for RAG and standard chat."""
+        if mode == "RAG (PDF Context)" and self.db is None:
+            yield "Please upload a PDF document first."
             return
 
         try:
-            messages = []
-            if sys_msg:
-                messages.append({"role": "system", "content": sys_msg})
+            messages = [{"role": "system", "content": sys_msg}] if sys_msg else []
             
-            if is_rag:
+            if mode == "RAG (PDF Context)":
                 results = self.db.similarity_search("query: " + user_input, k=4)
-                if not results:
-                    yield "No relevant context found in the document."
-                    return
-                context = "\n---\n".join(
-                    d.page_content.removeprefix("passage: ") for d in results
-                )
-                prompt = f"Context:\n{context}\n\nQuestion:\n{user_input}\n\nAnswer:"
+                prompt = self._build_rag_prompt(user_input, results) if results else user_input
             else:
                 prompt = user_input
 
             messages.append({"role": "user", "content": prompt})
-            
             yield from self.llm.generate(messages)
-
-
         except Exception as e:
-            if "dimension" in str(e).lower():
-                yield "Error: Embedding dimension mismatch — please re-upload your document."
-            else:
-                yield f"Query error: {e}"
+            yield f"Query error: {str(e)}"
